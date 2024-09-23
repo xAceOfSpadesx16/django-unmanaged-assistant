@@ -2,7 +2,7 @@
 
 import re
 from contextlib import ExitStack, contextmanager
-from typing import TextIO
+from typing import TextIO, Generator
 
 from django.apps import AppConfig, apps
 from django.conf import settings
@@ -14,24 +14,9 @@ from django.db.models import Field, Model
 from django.db.utils import ProgrammingError
 from psycopg2 import sql
 
+from management.core.manager import DatabaseManager
 
-def is_app_eligible(app_config: AppConfig) -> bool:
-    """
-    Check if the app is eligible for processing.
 
-    Args:
-        app_config (AppConfig): The Django app configuration.
-
-    Returns:
-        bool: True if the app is eligible for processing, False otherwise.
-    """
-    app_name = app_config.name.split('.')[-1]
-    exclude_path = getattr(settings, 'EXCLUDE_UNMANAGED_PATH', 'site-packages')
-    is_local_app = exclude_path not in app_config.path
-    is_additional_app = app_name in getattr(settings,
-                                            'ADDITIONAL_UNMANAGED_TABLE_APPS',
-                                            [])
-    return is_local_app or is_additional_app
 def get_default_schema(
     connection: BaseDatabaseWrapper,
 ) -> str | None:
@@ -54,9 +39,7 @@ def get_default_schema(
         return None
 
 
-def create_schema_if_not_exists(
-    connection: BaseDatabaseWrapper, schema: str
-) -> None:
+def create_schema_if_not_exists(connection: BaseDatabaseWrapper, schema: str) -> None:
     """
     Create the schema if it doesn't exist.
 
@@ -82,15 +65,11 @@ def create_schema_if_not_exists(
             return
         if connection.vendor == "postgresql":
             cursor.execute(
-                sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(
-                    sql.Identifier(schema)
-                )
+                sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(schema))
             )
         elif connection.vendor in ["microsoft", "mssql"]:
             # TODO: Verify Microsoft SQL Server schema creation
-            cursor.execute(
-                "SELECT 1 FROM sys.schemas WHERE name = %s", [schema]
-            )
+            cursor.execute("SELECT 1 FROM sys.schemas WHERE name = %s", [schema])
             if cursor.fetchone() is None:
                 cursor.execute(f"CREATE SCHEMA [{schema}]")
         else:
@@ -248,18 +227,13 @@ def types_are_compatible(existing_type: str, expected_type: str) -> bool:
     }
 
     for db_type, compatible_list in compatible_types.items():
-        if (
-            existing_type in compatible_list
-            and expected_type in compatible_list
-        ):
+        if existing_type in compatible_list and expected_type in compatible_list:
             return True
 
     return False
 
 
-def parse_table_name(
-    connection: BaseDatabaseWrapper, table_name: str
-) -> tuple:
+def parse_table_name(connection: BaseDatabaseWrapper, table_name: str) -> tuple:
     """
     Parse the table name into schema and table parts.
 
@@ -371,7 +345,7 @@ def get_formatted_table_name(
 @contextmanager
 def temporary_table_name(
     model: type[Model], connection: BaseDatabaseWrapper
-) -> str:
+) -> Generator[str, None, None]:
     """
     Context manager to temporarily change the db_table name of a model.
 
@@ -385,9 +359,7 @@ def temporary_table_name(
     original_db_table = model._meta.db_table
     if not connection.vendor == "sqlite":
         schema, table = parse_table_name(connection, original_db_table)
-        formatted_table_name = get_formatted_table_name(
-            connection, schema, table
-        )
+        formatted_table_name = get_formatted_table_name(connection, schema, table)
         model._meta.db_table = formatted_table_name
     try:
         yield
@@ -423,6 +395,7 @@ class Command(BaseCommand):
         self.verbose: bool | None = None
         self.connection = None
         self.models_to_process = []
+        self.manager: DatabaseManager = DatabaseManager(settings)
 
     def add_arguments(self, parser: CommandParser) -> None:
         """
@@ -457,7 +430,8 @@ class Command(BaseCommand):
         """
         self.verbose = options["detailed"]
         for app_config in apps.get_app_configs():
-            if is_app_eligible(app_config):
+            if self.manager.is_app_eligible(app_config):
+
                 self.collect_unmanaged_models(app_config)
 
         self.process_models()
@@ -492,9 +466,7 @@ class Command(BaseCommand):
             db_alias = "default"
             # TODO: Add support for dbrouters if they exist?
             if settings.APP_TO_DATABASE_MAPPING:
-                db_name = settings.APP_TO_DATABASE_MAPPING.get(
-                    model._meta.app_label
-                )
+                db_name = settings.APP_TO_DATABASE_MAPPING.get(model._meta.app_label)
                 if db_name:
                     db_alias = db_name
             connection = connections[db_alias]
@@ -509,15 +481,11 @@ class Command(BaseCommand):
                 with ExitStack() as stack:
                     # Apply temporary table names to all models
                     for model in models:
-                        stack.enter_context(
-                            temporary_table_name(model, connection)
-                        )
+                        stack.enter_context(temporary_table_name(model, connection))
 
                     # Now process each model
                     for model in models:
-                        self.create_table_for_model(
-                            connection, schema_editor, model
-                        )
+                        self.create_table_for_model(connection, schema_editor, model)
 
     def create_table_for_model(
         self,
@@ -549,9 +517,7 @@ class Command(BaseCommand):
         schema, table = parse_table_name(self.connection, table_name)
 
         if self.verbose:
-            self.stdout.write(
-                f"Processing table '{table}' in schema '{schema}'"
-            )
+            self.stdout.write(f"Processing table '{table}' in schema '{schema}'")
 
         if schema:
             create_schema_if_not_exists(self.connection, schema)
@@ -573,15 +539,11 @@ class Command(BaseCommand):
         else:
             if self.verbose:
                 self.stdout.write(
-                    self.style.SUCCESS(
-                        f"Table for {model.__name__} already exists"
-                    )
+                    self.style.SUCCESS(f"Table for {model.__name__} already exists")
                 )
 
         for field in model._meta.fields:
-            self.process_field(
-                connection, schema_editor, model, schema, table, field
-            )
+            self.process_field(connection, schema_editor, model, schema, table, field)
 
     def process_field(
         self,
@@ -640,9 +602,7 @@ class Command(BaseCommand):
                 schema_editor.add_field(model, field)
             except Exception as e:
                 self.stderr.write(
-                    self.style.ERROR(
-                        f"Error adding column {column_name}: {str(e)}"
-                    )
+                    self.style.ERROR(f"Error adding column {column_name}: {str(e)}")
                 )
         else:
             if self.verbose:
